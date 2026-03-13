@@ -20,12 +20,18 @@ class ProductRepository:
         name: str,
         description: str = "",
         price: float = 0.0,
-        created_by_user_id: Optional[UUID] = None,
+        image_front: str = "",
+        image_back: str = "",
+        condition: str = "",
+        created_by_user_id: UUID,
     ) -> Product:
         product = Product(
             name=name,
             description=description,
             price=price,
+            image_front=image_front,
+            image_back=image_back,
+            condition=condition,
             created_by_user_id=created_by_user_id,
         )
         self._session.add(product)
@@ -43,21 +49,20 @@ class ProductRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Product], int]:
-        """Search products; returns (items, total_count) in one query via COUNT(*) OVER ().
-        Offset is clamped to MAX_PAGINATION_OFFSET to avoid O(offset) cost and DoS.
-        Note: COUNT OVER loads one window of rows; if limit or join complexity grows, consider keyset pagination."""
+        """Search products; returns (items, total_count). Single query with COUNT(*) OVER() to avoid two round-trips."""
         max_offset = get_settings().MAX_PAGINATION_OFFSET
         offset = min(offset, max_offset)
-        total_col = func.count(Product.id).over().label("_total")
-        stmt = select(Product, total_col)
-        if q and q.strip():
-            term = f"%{q.strip().lower()}%"
+
+        term = f"%{q.strip().lower()}%" if q and q.strip() else None
+        total_expr = func.count(Product.id).over().label("_total")
+        stmt = select(Product, total_expr)
+        if term:
             stmt = stmt.where(
                 or_(Product.name.ilike(term), Product.description.ilike(term))
             )
         stmt = stmt.order_by(Product.id).limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         rows = result.all()
-        products = [row[0] for row in rows]
         total = int(rows[0][1]) if rows else 0
+        products = [row[0] for row in rows]
         return products, total

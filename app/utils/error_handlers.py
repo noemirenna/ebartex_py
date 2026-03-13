@@ -26,7 +26,7 @@ async def base_exception_handler(request: Request, exc: BaseException) -> Respon
     logger.error(
         "BaseException (not Exception)",
         extra={"request_id": request_id, "path": request.url.path, "type": type(exc).__name__},
-        exc_info=exc,
+        exc_info=True,
     )
     return Response(
         content=__json_content("An unexpected error occurred.", "INTERNAL_ERROR"),
@@ -47,7 +47,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> Response
     logger.error(
         "Unhandled exception",
         extra={"request_id": request_id, "path": request.url.path},
-        exc_info=exc,
+        exc_info=True,
     )
     return Response(
         content=__json_content("An unexpected error occurred.", "INTERNAL_ERROR"),

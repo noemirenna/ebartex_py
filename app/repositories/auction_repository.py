@@ -11,6 +11,18 @@ from app.core.config import get_settings
 from app.models.auction import Auction
 
 
+def _auction_list_where(stmt, q: Optional[str], status: Optional[str]):
+    """Apply optional filters for list/count. Reused so count and select stay in sync."""
+    if status:
+        stmt = stmt.where(Auction.status == status)
+    if q and q.strip():
+        term = f"%{q.strip().lower()}%"
+        stmt = stmt.where(
+            or_(Auction.title.ilike(term), Auction.description.ilike(term))
+        )
+    return stmt
+
+
 class AuctionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -19,7 +31,6 @@ class AuctionRepository:
         auction = Auction(
             title=data["title"],
             description=data.get("description", ""),
-            seller_username=data.get("seller_username"),
             starting_price=float(data["starting_price"]),
             current_price=float(data.get("current_price", data["starting_price"])),
             reserve_price=float(data["reserve_price"]) if data.get("reserve_price") is not None else None,
@@ -29,10 +40,12 @@ class AuctionRepository:
             highest_bidder_id=data.get("highest_bidder_id"),
             created_by_user_id=data.get("created_by_user_id"),
             product_id=data.get("product_id"),
-            game=data.get("game") or [],
-            card_name=data.get("card_name") or [],
-            condition=data.get("condition") or [],
-            images=data.get("images") or [],
+            image_front=data.get("image_front"),
+            image_back=data.get("image_back"),
+            video_url=data.get("video_url"),
+            buy_now_enabled=bool(data.get("buy_now_enabled", False)),
+            buy_now_price=float(data["buy_now_price"]) if data.get("buy_now_price") is not None else None,
+            buy_now_url=data.get("buy_now_url"),
         )
         self._session.add(auction)
         await self._session.flush()
@@ -62,25 +75,18 @@ class AuctionRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Auction], int]:
-        """List auctions with filters; returns (items, total_count) in one query via COUNT(*) OVER ().
-        Offset is clamped to MAX_PAGINATION_OFFSET to avoid O(offset) cost and DoS.
-        Note: COUNT OVER loads one window of rows; if limit or join complexity grows, consider keyset pagination."""
+        """List auctions with filters; returns (items, total_count). Single query with COUNT(*) OVER() to avoid two round-trips."""
         max_offset = get_settings().MAX_PAGINATION_OFFSET
         offset = min(offset, max_offset)
-        total_col = func.count(Auction.id).over().label("_total")
-        stmt = select(Auction, total_col)
-        if status:
-            stmt = stmt.where(Auction.status == status)
-        if q and q.strip():
-            term = f"%{q.strip().lower()}%"
-            stmt = stmt.where(
-                or_(Auction.title.ilike(term), Auction.description.ilike(term))
-            )
+
+        total_expr = func.count(Auction.id).over().label("_total")
+        stmt = select(Auction, total_expr)
+        stmt = _auction_list_where(stmt, q, status)
         stmt = stmt.order_by(Auction.end_time.desc()).limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         rows = result.all()
-        auctions = [row[0] for row in rows]
         total = int(rows[0][1]) if rows else 0
+        auctions = [row[0] for row in rows]
         return auctions, total
 
     async def update(self, auction: Auction) -> Auction:

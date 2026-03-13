@@ -55,6 +55,12 @@ class ProductNotFoundError(AppError):
         super().__init__(message, code="PRODUCT_NOT_FOUND", status_code=404)
 
 
+# P.IVA (venditori con partita IVA)
+class PivaRequiredError(AppError):
+    def __init__(self, message: str = "This feature is only available for sellers with VAT number (partita IVA)."):
+        super().__init__(message, code="PIVA_REQUIRED", status_code=403)
+
+
 # Generic
 class InvalidIdError(AppError):
     def __init__(self, message: str = "Invalid id."):

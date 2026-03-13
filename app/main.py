@@ -2,20 +2,19 @@
 FastAPI application entry point.
 CORS, middleware, routers, global exception handler.
 """
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
 
 from app.api import auctions_router, bids_router, me_router, products_router
 from app.core.config import get_settings
-from app.core.rate_limit import limiter
-from app.infrastructure.database import init_db, close_db
+from app.infrastructure.database import init_db, close_db, check_db_connected
 from app.infrastructure.http_client import init_http_client, close_http_client
-from app.infrastructure.redis_client import init_redis, close_redis
+from app.infrastructure.redis_client import init_redis, close_redis, check_redis_connected
 from app.utils.error_handlers import base_exception_handler, global_exception_handler
 from app.utils.request_id import request_id_middleware
 
@@ -26,13 +25,16 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     """Startup: load config, connect DB, Redis and shared HTTP client. Shutdown: close connections."""
     logger.info("Starting up: loading config and connections")
-    from app.core.security import load_public_key
-    load_public_key()
+    from app.core.security import load_public_key, shutdown_jwt_executor, get_jwt_executor
+    # Load JWT key in dedicated JWT executor to avoid blocking event loop and default executor
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(get_jwt_executor(), load_public_key)
     init_http_client()
     await init_db()
     await init_redis()
     yield
     logger.info("Shutting down: closing connections")
+    shutdown_jwt_executor()
     await close_http_client()
     await close_db()
     await close_redis()
@@ -46,8 +48,6 @@ app = FastAPI(
     docs_url="/docs" if settings.ENABLE_OPENAPI_DOCS else None,
     redoc_url="/redoc" if settings.ENABLE_OPENAPI_DOCS else None,
 )
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS: only allowed origins and headers (no wildcard to reduce surface with credentials)
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "Accept", "X-Request-ID"]
@@ -90,6 +90,19 @@ async def root() -> dict:
 
 
 @app.get("/health")
-async def health() -> dict:
-    """Health check for load balancer."""
-    return {"status": "ok"}
+async def health():
+    """
+    Health check for load balancer. Verifies DB and Redis; returns 503 if required dependency is down.
+    """
+    db_ok = await check_db_connected()
+    redis_ok = await check_redis_connected()
+    if not db_ok or not redis_ok:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "database": "ok" if db_ok else "down",
+                "redis": "ok" if redis_ok else "down",
+            },
+        )
+    return {"status": "ok", "database": "ok", "redis": "ok"}

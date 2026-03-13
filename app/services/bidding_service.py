@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
+from app.core.cache import invalidate_cached
 from app.core.config import get_settings
 from app.models.auction import Auction
 from app.models.bid import Bid
@@ -119,7 +120,10 @@ class BiddingService:
             auction.current_price = min_for_new_to_win
             auction.highest_bidder_id = user_id
         elif previous_leader_can_beat:
-            assert previous_leader_id is not None and previous_leader_max is not None
+            if previous_leader_id is None or previous_leader_max is None:
+                raise RuntimeError(
+                    "Invariant violation: previous_leader_can_beat requires previous_leader_id and previous_leader_max"
+                )
             await self._bid_repo.create(
                 _bid_create_data(auction_id, previous_leader_id, min_to_beat_new, previous_leader_max)
             )
@@ -140,6 +144,7 @@ class BiddingService:
             auction.end_time = now_dt + timedelta(minutes=MIN_REMAINING_MINUTES_AFTER_BID)
 
         await self._auction_repo.update(auction)
+        await invalidate_cached("auction", auction_id)
 
         bids_limit = get_settings().PLACE_BID_RESPONSE_BIDS_LIMIT
         updated_bids = await self._bid_repo.find_by_auction_id(auction_id, limit=bids_limit)

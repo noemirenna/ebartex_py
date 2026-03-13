@@ -1,10 +1,12 @@
 """
 JWT RS256 validation. Tokens are issued by BRX_auth; we validate with public key.
 Public key is re-read periodically (JWT_KEY_REFRESH_SECONDS) so rotation works without restart.
-Cache access is protected by _key_cache_lock to avoid race in multi-worker/async environments.
+Async path uses asyncio.Lock so key refresh does not block the event loop; jwt.decode and
+key parsing run in a dedicated thread pool to avoid blocking on CPU-bound work.
 """
-import threading
+import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import jwt
@@ -14,7 +16,32 @@ from app.core.config import Settings, get_settings
 
 # Cache: (key_bytes, timestamp). Refreshed when TTL expires so key rotation is picked up.
 _key_cache: Optional[tuple[bytes, float]] = None
-_key_cache_lock = threading.Lock()
+# asyncio.Lock: avoids blocking the event loop while waiting for key refresh (threading.Lock would block).
+_key_cache_lock = asyncio.Lock()
+
+# Dedicated executor for JWT decode and key loading; sized from config to handle high concurrency.
+_jwt_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_jwt_executor() -> ThreadPoolExecutor:
+    global _jwt_executor
+    if _jwt_executor is None:
+        workers = get_settings().JWT_EXECUTOR_MAX_WORKERS
+        _jwt_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jwt")
+    return _jwt_executor
+
+
+def get_jwt_executor() -> ThreadPoolExecutor:
+    """Return the dedicated JWT executor (e.g. for startup key loading). Creates it if needed."""
+    return _get_jwt_executor()
+
+
+def shutdown_jwt_executor() -> None:
+    """Call at app shutdown to release the dedicated JWT thread pool."""
+    global _jwt_executor
+    if _jwt_executor is not None:
+        _jwt_executor.shutdown(wait=False)
+        _jwt_executor = None
 
 
 def _format_pem_key(key_str: str, is_private: bool = False) -> bytes:
@@ -49,41 +76,46 @@ def _should_refresh(settings: Settings) -> bool:
 
 
 def load_public_key() -> bytes:
-    """Load JWT public key and prime cache. Called at startup to fail fast if misconfigured."""
+    """Load JWT public key and prime cache. Called at startup (sync) to fail fast if misconfigured."""
     global _key_cache
     settings = get_settings()
     key_bytes = _load_key_from_settings(settings)
-    with _key_cache_lock:
-        _key_cache = (key_bytes, time.monotonic())
+    _key_cache = (key_bytes, time.monotonic())
     return key_bytes
 
 
-def get_public_key_bytes() -> bytes:
-    """Return current public key; re-read from config when TTL expires (supports key rotation). Thread-safe.
-    Lock is held for the entire check-refresh-return so only one thread performs refresh, avoiding duplicate loads."""
+async def get_public_key_bytes() -> bytes:
+    """Return current public key; re-read from config when TTL expires. Key loading runs in executor to avoid blocking the event loop."""
     global _key_cache
     settings = get_settings()
-    with _key_cache_lock:
+    async with _key_cache_lock:
         if _should_refresh(settings):
-            key_bytes = _load_key_from_settings(settings)
+            loop = asyncio.get_event_loop()
+            key_bytes = await loop.run_in_executor(_get_jwt_executor(), lambda: _load_key_from_settings(settings))
             _key_cache = (key_bytes, time.monotonic())
         return _key_cache[0]
 
 
-def decode_access_token(token: str) -> dict[str, Any]:
+async def decode_access_token(token: str) -> dict[str, Any]:
     """
-    Decode and validate JWT (signature + exp).
+    Decode and validate JWT (signature + exp). Runs signature verification in a thread pool
+    so the event loop is not blocked (RSA is CPU-bound).
     Raises InvalidTokenError or DecodeError on failure.
     Returns payload dict; use payload['sub'] for user_id.
     """
     settings = get_settings()
-    key = get_public_key_bytes()
-    payload = jwt.decode(
-        token,
-        key,
-        algorithms=[settings.JWT_ALGORITHM],
-        options={"verify_exp": True, "verify_signature": True},
-    )
+    key = await get_public_key_bytes()
+
+    def _decode() -> dict[str, Any]:
+        return jwt.decode(
+            token,
+            key,
+            algorithms=[settings.JWT_ALGORITHM],
+            options={"verify_exp": True, "verify_signature": True},
+        )
+
+    loop = asyncio.get_event_loop()
+    payload = await loop.run_in_executor(_get_jwt_executor(), _decode)
     if payload.get("type") != "access":
         raise InvalidTokenError("Token type must be access")
     return payload

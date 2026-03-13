@@ -2,12 +2,12 @@
 SQLAlchemy model for auctions (marketplace). Status: DRAFT | ACTIVE | CLOSED.
 """
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import BigInteger, DateTime, Float, String, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.database import Base
 
@@ -18,7 +18,6 @@ class Auction(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    seller_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     starting_price: Mapped[float] = mapped_column(Float, nullable=False)
     current_price: Mapped[float] = mapped_column(Float, nullable=False)
     reserve_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -28,10 +27,14 @@ class Auction(Base):
     highest_bidder_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     created_by_user_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    game: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True, default=list)
-    card_name: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True, default=list)
-    condition: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True, default=list)
-    images: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True, default=list)
+    image_front: Mapped[str] = mapped_column(Text, nullable=False)
+    image_back: Mapped[str] = mapped_column(Text, nullable=False)
+    video_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # P.IVA only
+    buy_now_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # P.IVA only
+    # buy_now_price: price shown for "buy it now" (optional; defaults to product price when buy_now_enabled)
+    buy_now_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # buy_now_url: link to product sale page; user is redirected here to buy without bidding (required if buy_now_enabled)
+    buy_now_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

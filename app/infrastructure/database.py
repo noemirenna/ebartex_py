@@ -24,6 +24,7 @@ engine = create_async_engine(
     _db_url,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_timeout=settings.DB_POOL_TIMEOUT,
     echo=settings.DEBUG,
 )
 
@@ -42,6 +43,37 @@ async def init_db() -> None:
     """Verify connection on startup. Tables are created via Alembic migrations."""
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
+    # Warn if pool could exceed PostgreSQL max_connections with multiple workers
+    try:
+        async with engine.connect() as conn:
+            r = await conn.execute(text("SELECT current_setting('max_connections')::int"))
+            pg_max = r.scalar() or 100
+    except Exception:
+        pg_max = None
+    pool_total = settings.DB_POOL_SIZE + settings.DB_MAX_OVERFLOW
+    if pg_max is not None and pool_total >= pg_max:
+        logger.error(
+            "DB pool (size={} + overflow={}) >= PG max_connections ({}); reduce pool or increase PG max_connections",
+            settings.DB_POOL_SIZE,
+            settings.DB_MAX_OVERFLOW,
+            pg_max,
+        )
+    elif pg_max is not None and pool_total * 2 > pg_max:
+        logger.warning(
+            "DB pool per process ({} total) may exceed PG max_connections ({}) with 2+ workers; tune pool or max_connections",
+            pool_total,
+            pg_max,
+        )
+
+
+async def check_db_connected() -> bool:
+    """Return True if DB is reachable (for health check)."""
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
 
 
 async def close_db() -> None:

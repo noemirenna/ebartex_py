@@ -24,8 +24,7 @@ httpx>=0.26.0
 pyjwt[crypto]>=2.8.0
 cryptography>=42.0.0
 
-# Rate limiting (Redis-backed)
-slowapi>=0.1.9
+# Rate limiting: in-app async Redis (see app.core.rate_limit), no separate lib
 
 # Logging
 loguru>=0.7.2

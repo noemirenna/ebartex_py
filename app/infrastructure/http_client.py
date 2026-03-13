@@ -1,12 +1,13 @@
 """
 Shared async HTTP client for outbound calls (Auth, BRX_Search).
 Connection pooling is used when the same client is reused; init at startup and close at shutdown.
-FastAPI: init in lifespan. Worker: init at start of main(), close in finally.
+Limits are read from config so high concurrency does not starve outbound requests.
 """
 from typing import Optional
 
 import httpx
 
+from app.core.config import get_settings
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -19,17 +20,21 @@ def get_http_client() -> httpx.AsyncClient:
 
 
 def init_http_client(
-    timeout: float = 30.0,
+    timeout: Optional[float] = None,
     limits: Optional[httpx.Limits] = None,
 ) -> httpx.AsyncClient:
-    """Create and set the global async client. Idempotent: if already set, returns it."""
+    """Create and set the global async client. Idempotent: if already set, returns it.
+    When timeout/limits are not passed, uses HTTP_* settings from config."""
     global _client
     if _client is not None:
         return _client
-    _client = httpx.AsyncClient(
-        timeout=timeout,
-        limits=limits or httpx.Limits(max_keepalive_connections=20, max_connections=50),
+    settings = get_settings()
+    _timeout = timeout if timeout is not None else settings.HTTP_TIMEOUT_SECONDS
+    _limits = limits if limits is not None else httpx.Limits(
+        max_keepalive_connections=settings.HTTP_KEEPALIVE_CONNECTIONS,
+        max_connections=settings.HTTP_MAX_CONNECTIONS,
     )
+    _client = httpx.AsyncClient(timeout=_timeout, limits=_limits)
     return _client
 
 

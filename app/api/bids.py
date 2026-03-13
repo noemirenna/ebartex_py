@@ -7,14 +7,15 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from starlette.requests import Request
 
+from app.core.config import get_settings
 from app.core.dependencies import get_bidding_service, get_current_user_id
-from app.core.rate_limit import get_request, limiter
+from app.core.rate_limit import rate_limit
 from app.schemas.bid import BidCreate
 from app.services.bidding_service import BiddingService
 
 router = APIRouter()
+settings = get_settings()
 
 
 @router.post(
@@ -23,13 +24,12 @@ router = APIRouter()
     status_code=201,
     description="Place a bid on an auction. Min increment and 5-min extension apply. Requires Bearer token.",
 )
-@limiter.limit("60/minute")
 async def place_bid(
-    request: Annotated[Request, Depends(get_request)],
     auction_id: int,
     body: BidCreate,
     user_id: Annotated[UUID, Depends(get_current_user_id)],
     service: BiddingService = Depends(get_bidding_service),
+    _rate_limit: None = Depends(rate_limit(settings.RATE_LIMIT_DEFAULT)),
 ):
     result = await service.place_bid(
         auction_id=auction_id,

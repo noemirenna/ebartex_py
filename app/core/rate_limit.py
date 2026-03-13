@@ -1,42 +1,112 @@
 """
-Rate limiting: per-IP limits shared across instances via Redis.
-When TRUSTED_PROXY is True, uses X-Forwarded-For (real client IP behind proxy).
-When False, uses direct client IP only to avoid spoofing (X-Forwarded-For is client-controlled).
+Rate limiting: per-IP limits shared across instances via Redis (async, non-blocking).
+When TRUSTED_PROXY is True, uses X-Forwarded-For (real client IP behind proxy); value is validated to look like an IP.
+When False, uses direct client IP only to avoid spoofing.
 
-Routes that use @limiter.limit(...) must receive Request via Depends(get_request) so the limiter
-can compute the client key; use Annotated[Request, Depends(get_request)] to keep the dependency explicit.
+Uses the app's shared async Redis client so the event loop is never blocked.
+If Redis is unavailable: RATE_LIMIT_FAIL_CLOSED=True -> 503; False -> fail open (no limit).
 """
+import re
+import time
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, status
+from loguru import logger
 from starlette.requests import Request
 
-from fastapi import Depends
-from slowapi import Limiter
-from slowapi.util import get_ipaddr
-
 from app.core.config import get_settings
+from app.infrastructure.redis_client import get_redis_optional
 
-settings = get_settings()
+# Redis key prefix; TTL (seconds) for the counter key so it expires after 2 minutes.
+RATE_LIMIT_KEY_PREFIX = "ebartex:ratelimit"
+RATE_LIMIT_KEY_TTL = 120
+
+# Basic IP-like pattern to reject obviously spoofed X-Forwarded-For (e.g. long strings, scripts).
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+_IPV6_RE = re.compile(r"^\[?[0-9a-fA-F:.]+\]?$")
 
 
 def get_request(request: Request) -> Request:
-    """Dependency that provides Request for rate limiting. Use in route signatures with @limiter.limit(...).
-    Injects the same Request FastAPI would pass; required so SlowAPI can compute the client key."""
+    """Dependency that provides Request. Used by rate_limit dependency to get client IP."""
     return request
 
 
-def _rate_limit_key(request: Request) -> str:
-    """IP for rate limit: X-Forwarded-For only when behind a trusted proxy, else direct client IP."""
+def _looks_like_ip(value: str) -> bool:
+    """True if value looks like an IPv4 or IPv6 address (reject spoofed non-IP content)."""
+    if not value or len(value) > 45:
+        return False
+    return bool(_IPV4_RE.match(value) or _IPV6_RE.match(value))
+
+
+def _client_ip(request: Request) -> str:
+    """IP for rate limit: X-Forwarded-For only when behind a trusted proxy and value looks like an IP, else direct client IP."""
+    settings = get_settings()
     if settings.TRUSTED_PROXY:
-        return get_ipaddr(request)
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            leftmost = forwarded.split(",")[0].strip() or ""
+            if _looks_like_ip(leftmost):
+                return leftmost
+            # Invalid or spoofed-looking value: fall back to direct client
+            logger.debug("X-Forwarded-For leftmost value does not look like IP, using direct client")
     if request.client:
         return request.client.host or "0.0.0.0"
     return "0.0.0.0"
 
 
-# Redis storage: limit is shared across all app replicas; key = client IP (see _rate_limit_key).
-# SlowAPI/limits opens its own Redis connections from REDIS_URL; the app uses init_redis() for the
-# reindex queue (see redis_client). Two pools toward the same Redis: set REDIS_MAX_CONNECTIONS in
-# config for the app pool; ensure Redis server maxclients can accommodate both app and limiter.
-limiter = Limiter(
-    key_func=_rate_limit_key,
-    storage_uri=settings.REDIS_URL,
-)
+async def _check_rate_limit(request: Request, requests_per_minute: int) -> None:
+    """
+    Increment per-IP counter for current minute in Redis; raise 429 if over limit.
+    Uses fixed 1-minute window. If Redis unavailable: fail-closed (503) or fail-open per config.
+    requests_per_minute <= 0 is treated as "reject all" to avoid accidental DoS (no limit).
+    """
+    if requests_per_minute <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded",
+        )
+    redis = get_redis_optional()
+    if not redis:
+        settings = get_settings()
+        if settings.RATE_LIMIT_FAIL_CLOSED:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiting temporarily unavailable",
+            )
+        return
+    ip = _client_ip(request)
+    window = int(time.time()) // 60
+    key = f"{RATE_LIMIT_KEY_PREFIX}:{ip}:{window}"
+    try:
+        pipe = redis.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, RATE_LIMIT_KEY_TTL)
+        results = await pipe.execute()
+        count = results[0]
+        if count > requests_per_minute:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Redis error: fail-closed or fail-open per config
+        logger.warning("Rate limit check failed (Redis): {}", e)
+        settings = get_settings()
+        if settings.RATE_LIMIT_FAIL_CLOSED:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiting temporarily unavailable",
+            )
+
+
+def rate_limit(requests_per_minute: int):
+    """
+    Dependency factory: returns a callable for Depends() that enforces requests_per_minute per IP per minute.
+    Use in route as: Depends(rate_limit(60)).
+    """
+    async def _dep(request: Annotated[Request, Depends(get_request)]) -> None:
+        await _check_rate_limit(request, requests_per_minute)
+
+    return _dep

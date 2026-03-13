@@ -47,6 +47,17 @@ async def close_redis() -> None:
         _client = None
 
 
+async def check_redis_connected() -> bool:
+    """Return True if Redis is reachable (for health check)."""
+    if _client is None:
+        return False
+    try:
+        await _client.ping()
+        return True
+    except Exception:
+        return False
+
+
 def get_redis() -> redis.Redis:
     """Return the shared Redis client. Raises RedisNotConnectedError if not initialized or connection failed."""
     if _client is None:
